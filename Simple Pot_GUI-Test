@@ -1,0 +1,94 @@
+###################################################################################################################
+#                                                                                                                 #
+#                                         " Simple Pot_GUI "                                                      #
+#                                                                                                                 #   
+###################################################################################################################
+
+
+# import libraries
+import serial
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+import time
+import tkinter as tk
+from tkinter import ttk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+# Global variables
+global is_plotting
+is_plotting = False
+
+# Initialize serial communication
+try:
+    Arduino = serial.Serial('COM3', 9600, timeout=1) # Change COM port as needed for Windows
+except serial.SerialException as e:
+    print(f"Error opening serial port: {e}")
+    exit()
+
+# Variables for plotting
+x_data = []
+y_data = []
+
+# Create figure for plotting
+fig, ax = plt.subplots(figsize=(15, 10))   
+line, = ax.plot([], [], lw=2)
+ax.set_xlabel('Time (s)')   
+ax.set_ylabel('Potincimeter Value')
+ax.set_title('Real-Time Serial Data')
+
+# Function to update plot
+def update_plot(frame):
+    global is_plotting
+    if is_plotting and Arduino.in_waiting > 0:
+        data = Arduino.readline().decode('ascii').strip()
+        try:
+            value = int(data)
+            x_data.append(time.time())  
+            y_data.append(value)
+            line.set_data(x_data, y_data)
+            ax.relim()
+            ax.autoscale_view()
+        except ValueError:
+            print(f"Invalid data: {data}")
+    
+    return line,
+
+# Animation function
+def start_plotting():
+    global is_plotting
+    is_plotting = True
+
+def stop_plotting():
+    global is_plotting
+    is_plotting = False
+
+ani = FuncAnimation(fig, update_plot, interval=1)
+
+# Create GUI
+root = tk.Tk()
+root.title('Real-Time Serial Plotter')
+
+# Frame for buttons
+button_frame = ttk.Frame(root)
+button_frame.pack(padx=10, pady=10)
+
+start_button = ttk.Button(button_frame, text="Start", command=start_plotting)
+start_button.pack(side=tk.LEFT, padx=10)
+
+stop_button = ttk.Button(button_frame, text="Stop", command=stop_plotting)
+stop_button.pack(side=tk.LEFT, padx=10)
+
+# Canvas to display plot
+canvas_widget = FigureCanvasTkAgg(fig, master=root)
+canvas_widget.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+# Show plot
+plt.ion()  # Turn on interactive mode
+plt.show()
+
+# Start tkinter event loop
+root.mainloop()
+
+# Clean up
+is_plotting = False
+Arduino.close()
