@@ -1,0 +1,453 @@
+import sys
+import os
+from time import time, sleep
+
+import dearpygui.dearpygui as dpg
+import matplotlib.pyplot as plt
+
+import threading
+from collections import deque
+
+import csv
+import scipy.io
+
+import serial # pySerial
+import serial.tools.list_ports
+
+from gigautil import volt2flux, volt2temp # sensor conversion routines
+
+# version info
+NUM_VERSION = '1.01'
+DT_VERSION = '20240731'
+
+# DAQ commands
+START_DAQ = b'1'
+STOP_DAQ = b'2'
+ENABLE_HEATER = b'3'
+DISABLE_HEATER = b'4'
+
+# DAQ configuration
+HEATDAQ = 'HeatDAQ'
+DASH = 'DASH'
+GENERAL = 'General'
+daq_configuration = HEATDAQ
+# sample rate
+daq_sample_rate = 20.0 # Hz for HeatDAQ
+
+#
+# buffers
+#
+DATA_MAX_LEN = 20000 # max data buffer size
+CMD_MAX_LEN = 1000 # max command buffer size
+num_channels = 4 # number of channels
+# data buffers
+data_idx = 0 # index of next data value in queue
+data_t = deque(maxlen=DATA_MAX_LEN) # time data
+data_y = [deque(maxlen=DATA_MAX_LEN) for _ in range(num_channels)] # voltage data
+# command buffer
+commands = deque(maxlen=CMD_MAX_LEN) # command data
+
+#
+# daq comm
+#
+daq = None # daq interface
+daq_is_connected = False # daq interface status
+daq_com_port = 'COM1' # default settings
+baud_rate = 115200 # default baud rate
+# daq_com_port = '/dev/tty.usbmodem101' # daq port; set this manually for now
+global com_port_items
+com_port_items = serial.tools.list_ports.comports()
+
+# data acquisition is on/off
+daq_is_started = False
+
+# heater is enabled/disabled
+heater_is_enabled = False
+
+# sensor values
+heat_flux_sensitivity = 0.8 # uV/(W/m^2)
+cold_junction_temperature = 22.14 # C
+
+# exit the program
+def exit(sender, app_data, user_data):
+    print('Application exited.')
+    # clean and close up daq
+    if daq and daq.isOpen():
+        daq.write(STOP_DAQ)  # send STOP_DAQ command to Arduino  
+        daq.write(DISABLE_HEATER)  # disable heater  
+        daq.close()
+
+# user selected File | Exit
+def file_exit(sender, app_data, user_data):
+    dpg.stop_dearpygui()
+
+# clear com buffers
+def clear_daq_buffers():
+    if daq:
+        daq.reset_input_buffer() # clear input buffer
+        daq.read_all() # read anything dangling (this happens), or timeout
+        daq.reset_output_buffer() # clear output buffer
+      
+# connect/disconnect the DAQ via serial
+def connect_disconnect_daq(sender, app_data, user_data):
+    global daq_is_started, daq, daq_is_connected, baud_rate
+    try:
+        if daq_is_connected == False:
+            daq = serial.Serial(daq_com_port, baud_rate, timeout=1)
+            daq.isOpen()
+            clear_daq_buffers()
+            daq_is_connected = True
+            dpg.set_item_label(connect_disconnect_daq_button, "Disconnect DAQ")
+            dpg.set_value(status_text, f'DAQ is connected to {daq_com_port}.')            
+        else:
+            daq_is_started = False
+            dpg.set_item_label(start_stop_daq_button, "Start DAQ")
+            if daq and daq.isOpen():
+                daq.write(STOP_DAQ)  # turn off DAQ
+                daq.write(DISABLE_HEATER) # disable heater
+                clear_daq_buffers()                
+                daq.close()
+            daq = None
+            daq_is_connected = False
+            dpg.set_item_label(connect_disconnect_daq_button, "Connect DAQ") 
+            dpg.set_value(status_text, 'DAQ is not connected.')   
+
+    except Exception as e:
+        dpg.set_value(status_text, f'Error. {e}')
+        if daq and daq.isOpen():
+            daq.close()
+            daq = None
+        daq_is_connected = False
+        dpg.set_item_label(connect_disconnect_daq_button, "Connect DAQ") 
+        daq_is_started = False
+        dpg.set_item_label(start_stop_daq_button, "Start DAQ")
+
+# toggle data acquisition
+def start_stop_daq(sender, app_data, user_data):
+    global daq_is_started, data_idx
+    if not daq_is_connected:
+        dpg.set_value(status_text, 'Error. DAQ is not connected.')
+        return
+    if not daq_is_started:
+        daq_is_started = True
+        thread = threading.Thread(target=read_daq_data, args=(), daemon=True)
+        thread.start()
+        dpg.set_item_label(start_stop_daq_button, "Stop DAQ")
+        clear_daq_buffers()
+        daq.write(START_DAQ)  # send START_DAQ command to Arduino
+        dpg.set_value(status_text, 'DAQ started.')
+        # reset data
+        data_idx = 0
+        data_t.clear()
+        for channel in range(num_channels):
+            data_y[channel].clear()
+    else:
+        daq_is_started = False
+        dpg.set_item_label(start_stop_daq_button, "Start DAQ")
+        daq.write(STOP_DAQ)  # send STOP_DAQ command to Arduino
+        clear_daq_buffers()
+        dpg.set_value(status_text, 'DAQ stopped.')        
+            
+# toggle heater
+def enable_disable_heater(sender, app_data, user_data):
+    global heater_is_enabled
+    if not daq_is_connected:
+        dpg.set_value(status_text, 'Error. DAQ is not connected.')
+        return
+    if not heater_is_enabled:
+        heater_is_enabled = True
+        dpg.set_item_label(enable_disable_heater_button, "Disable heater")
+        daq.write(ENABLE_HEATER)  # send ENABLE_HEATER command to Arduino
+        dpg.set_value(status_text, 'Heater is enabled.')
+    else:
+        heater_is_enabled = False
+        dpg.set_item_label(enable_disable_heater_button, "Enable heater")
+        daq.write(DISABLE_HEATER)  # send DISABLE_HEATER command to Arduino
+        dpg.set_value(status_text, 'Heater is disabled.')  
+
+def change_plot_labels():
+    for channel in range(num_channels):
+        yaxis_label = f"yaxis {channel + 1}"  
+        if daq_configuration == HEATDAQ:
+            if channel == 0:
+                dpg.set_item_label(yaxis_label, "Heat Flux (W/m^2)")
+            elif channel == 1:
+                dpg.set_item_label(yaxis_label, "Temperature (C)")
+            elif channel == 2:
+                dpg.set_item_label(yaxis_label, "Nothing")   
+            elif channel == 3:
+                dpg.set_item_label(yaxis_label, "Heater (0/1)")    
+            else:
+                dpg.set_item_label(yaxis_label, "Unknown")   
+        elif daq_configuration == DASH: 
+            if channel == 0:
+                dpg.set_item_label(yaxis_label, "Heat Flux (W/m^2)")
+            elif channel == 1:
+                dpg.set_item_label(yaxis_label, "Temperature 1 (C)")
+            elif channel == 2:
+                dpg.set_item_label(yaxis_label, "Temperature 2 (C)")   
+            elif channel == 3:
+                dpg.set_item_label(yaxis_label, "Heater (0/1)")    
+            else:
+                dpg.set_item_label(yaxis_label, "Unknown")  
+        elif daq_configuration == GENERAL:
+            dpg.set_item_label(yaxis_label, f"Voltage (V)")
+        else:
+            dpg.set_item_label(yaxis_label, f"Ch. {channel + 1}")
+
+# read daq data
+def read_daq_data():
+    global data_idx
+    while daq_is_connected and daq_is_started:
+        try:
+            if daq.in_waiting > 0:
+                line = daq.readline().decode('ascii').strip()
+                if line:
+                    y0, y1, y2, y3 = map(float, line.split(','))
+                    data_t.append(data_idx/daq_sample_rate)
+                    data_idx = data_idx + 1
+                    if daq_configuration == HEATDAQ:
+                        data_y[0].append(volt2flux(y0*1E6, heat_flux_sensitivity, 'uV'))
+                        data_y[1].append(volt2temp(y1, cold_junction_temperature, 'V', 'C')) # what should we do with room temp?
+                        data_y[2].append(y2)
+                        data_y[3].append(y3)
+                    elif daq_configuration == DASH: 
+                        data_y[0].append(y0)
+                        data_y[1].append(y1)
+                        data_y[2].append(y2)
+                        data_y[3].append(y3)
+                    elif daq_configuration == GENERAL:
+                        data_y[0].append(y0)
+                        data_y[1].append(y1)
+                        data_y[2].append(y2)
+                        data_y[3].append(y3)                         
+                    else:
+                        data_y[0].append(-1)
+                        data_y[1].append(-1)
+                        data_y[2].append(-1)
+                        data_y[3].append(-1)                                                                
+                    # update plot
+                    for channel in range(num_channels):
+                        line_label = f"line {channel + 1}"
+                        xaxis_label = f"xaxis {channel + 1}"
+                        yaxis_label = f"yaxis {channel + 1}"
+                        dpg.configure_item(line_label, x=list(data_t), y=list(data_y[channel]))
+                        dpg.fit_axis_data(xaxis_label)
+                        if channel == num_channels-1: # heater is set to fixed range, 0 to 1
+                            dpg.set_axis_limits(yaxis_label, -0.1, 1.1)
+                        else:
+                            dpg.fit_axis_data(yaxis_label)
+        except Exception as e:
+            dpg.set_value(status_text, f'Error. {e}')
+            return   
+        
+# save data as CSV
+def save_as_csv(file_path):
+    with open(file_path, 'w', newline='') as csvfile:
+        csvwriter = csv.writer(csvfile)
+        # no header
+        # time (s), heat flux (W/m^2), T1 (C), T2 (C; for DASH only! 0 for HeatDAQ), Heater State (0/1)
+        #csvwriter.writerow(['Elapsed Time (s)', 'Heat Flux (W/m^2)', 'Temperature (C)'])
+        for i in range(len(data_t)):
+            row = [data_t[i], data_y[0][i], data_y[1][i], data_y[2][i], data_y[3][i]]
+            csvwriter.writerow(row)
+    dpg.set_value(status_text, f'Data saved as CSV to {file_path}.')
+
+# save data as MAT
+def save_as_mat(file_path):
+    # there is a placeholder 0 in temperature 2 for HeatDAQ
+    if daq_configuration == DASH:
+        mat_data = {'time': list(data_t), 'heat_flux': list(data_y[0]), 'temp1': list(data_y[1]), 'temp2': list(data_y[2]), 'heater': list(data_y[3])}
+    elif daq_configuration == HEATDAQ:
+        mat_data = {'time': list(data_t), 'heat_flux': list(data_y[0]), 'temp1': list(data_y[1]), 'nothing': list(data_y[2]), 'heater': list(data_y[3])}
+    else:
+        mat_data = {'time': list(data_t), 'ch1': list(data_y[0]), 'ch2': list(data_y[1]), 'ch3': list(data_y[2]), 'ch4': list(data_y[3])}
+    scipy.io.savemat(file_path, mat_data)
+    dpg.set_value(status_text, f'Data saved as MAT to {file_path}.')
+
+# create folder selection dialog
+def file_dialog_callback(sender, app_data, file_type):
+    if file_type == "csv":
+        save_as_csv(app_data["file_path_name"])
+    elif file_type == "mat":
+        save_as_mat(app_data["file_path_name"])
+
+# set the COM port
+# update the COM port list when the dropdown is clicked
+def set_com_port(sender, app_data, user_data):
+    global daq_com_port
+    l = [str(i) for i in com_port_items]
+    idx = l.index(app_data)
+    daq_com_port = com_port_items[idx].device
+    dpg.set_value(status_text, f"DAQ port set to {daq_com_port}")
+
+def refresh_com_port_list(sender, app_data, user_data):
+    global daq_com_port
+    com_port_items.clear()
+    daq_com_port = 'UNK1'
+    for com_port in serial.tools.list_ports.comports():
+        if com_port[1].find('Bluetooth') == -1:
+            com_port_items.append(com_port)
+    dpg.configure_item(com_port_drop_down, items=com_port_items)
+    dpg.set_value(com_port_drop_down, 'Select COM Port')
+
+
+# set heat flux sensitivity
+def set_heat_flux_sensitivity(sender, app_data, user_data):
+    global heat_flux_sensitivity
+    heat_flux_sensitivity = float(app_data)
+    dpg.set_value(status_text, f"Heat flux sensitivity set to {heat_flux_sensitivity} uV/(W/m^2)")
+
+# set cold junction temperature
+def set_cold_junction_temperature(sender, app_data, user_data):
+    global cold_junction_temperature
+    cold_junction_temperature = float(app_data)
+    dpg.set_value(status_text, f"Cold junction temperature set to {cold_junction_temperature} C")
+
+# set the configuration (HeatDAQ, DASH)
+def set_configuration(sender, app_data, user_data):
+    global daq_configuration, daq_sample_rate
+    daq_configuration = app_data
+    if daq_configuration == HEATDAQ:
+        daq_sample_rate = 20 # Hz
+    elif daq_configuration == DASH:
+        daq_sample_rate = 61 # Hz - might change
+    elif daq_configuration == GENERAL:
+        daq_sample_rate = 20 # Hz - might change        
+    else:
+        daq_sample_rate = 1 # just use indices           
+    change_plot_labels()
+    dpg.set_value(status_text, f'Configuration set to {daq_configuration}')
+
+def set_baud_rate(sender, app_data, user_data):
+    global baud_rate
+    baud_rate = app_data
+    dpg.set_value(status_text, f'Baud rate set to {baud_rate}')
+
+# main script
+if __name__ == '__main__':
+    # global com_port_items
+    # create dpg main context
+    dpg.create_context()
+
+    # create the main Window
+    with dpg.window(tag="Main Window", label="Main Control Panel", width=800, height=1000):
+        # about box
+        with dpg.window(label="About", modal=True, show=False, tag="about"):
+            dpg.add_text(f"GigaGUI v{NUM_VERSION} {DT_VERSION}")
+
+        # menu bar
+        with dpg.menu_bar():
+            # file menu
+            with dpg.menu(label="File"):
+                dpg.add_menu_item(label="Save as CSV", callback=lambda: dpg.show_item("file_dialog_csv"))
+                dpg.add_menu_item(label="Save as MAT", callback=lambda: dpg.show_item("file_dialog_mat"))
+                dpg.add_menu_item(label="Exit", callback=file_exit)
+
+            # help menu
+            with dpg.menu(label="Help"):
+                dpg.add_menu_item(label="About", callback=lambda: dpg.configure_item("about", show=True))
+
+        status_text = dpg.add_text(default_value=f"Click 'Connect DAQ' to begin.")
+
+        # tabs
+        with dpg.tab_bar():
+            # main tab
+            with dpg.tab(label="Main"):
+
+                with dpg.group(label="Control Buttons", horizontal=True):
+                    connect_disconnect_daq_button = dpg.add_button(label="Connect DAQ", callback=connect_disconnect_daq, width=120, height=30)
+                    start_stop_daq_button = dpg.add_button(label="Start DAQ", callback=start_stop_daq, width=120, height=30)
+                    enable_disable_heater_button = dpg.add_button(label="Enable heater", callback=enable_disable_heater, width=120, height=30)
+
+                for channel in range(num_channels):
+                    plot_label = f"Channel {channel + 1}"
+                    xaxis_label = f"xaxis {channel + 1}"
+                    yaxis_label = f"yaxis {channel + 1}"
+                    line_label = f"line {channel + 1}"
+                    with dpg.plot(label=plot_label, height=150, width=975):
+                        dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag=xaxis_label)
+                        if daq_configuration == HEATDAQ:
+                            if channel == 0:
+                                dpg.add_plot_axis(dpg.mvYAxis, label="Heat Flux (W/m^2)", tag=yaxis_label)
+                            elif channel == 1:
+                                dpg.add_plot_axis(dpg.mvYAxis, label="Temperature (C)", tag=yaxis_label)
+                            elif channel == 2:
+                                dpg.add_plot_axis(dpg.mvYAxis, label="Nothing", tag=yaxis_label)   
+                            elif channel == 3:
+                                dpg.add_plot_axis(dpg.mvYAxis, label="Heater (0/1)", tag=yaxis_label)    
+                            else:
+                                dpg.add_plot_axis(dpg.mvYAxis, label="Unknown", tag=yaxis_label)   
+                        elif daq_configuration == DASH: 
+                            if channel == 0:
+                                dpg.add_plot_axis(dpg.mvYAxis, label="Heat Flux (W/m^2)", tag=yaxis_label)
+                            elif channel == 1:
+                                dpg.add_plot_axis(dpg.mvYAxis, label="Temperature 1 (C)", tag=yaxis_label)
+                            elif channel == 2:
+                                dpg.add_plot_axis(dpg.mvYAxis, label="Temperature 2 (C)", tag=yaxis_label)   
+                            elif channel == 3:
+                                dpg.add_plot_axis(dpg.mvYAxis, label="Heater (0/1)", tag=yaxis_label)    
+                            else:
+                                dpg.add_plot_axis(dpg.mvYAxis, label="Unknown", tag=yaxis_label)  
+                        elif daq_configuration == GENERAL:
+                            dpg.add_plot_axis(dpg.mvYAxis, label=f"Ch. {channel + 1} (V)", tag=yaxis_label)
+                        else:
+                           dpg.add_plot_axis(dpg.mvYAxis, label=f"Ch. {channel + 1}", tag=yaxis_label)
+
+                        dpg.add_line_series([], [], tag=line_label, parent=yaxis_label)
+            # settings tab
+            with dpg.tab(label="Settings"):
+                with dpg.group(label="DAQ Configuration", horizontal=True):
+                    dpg.add_text("Configuration:")                    
+                    dpg.add_radio_button([HEATDAQ, DASH, GENERAL], default_value=HEATDAQ, horizontal=True, callback=set_configuration)
+                # COM port selection
+                with dpg.group(label="COM Port", horizontal=True):
+                    dpg.add_text("COM Port:")
+                    # filter out Bluetooth devices; these can cause hang-ups
+                    items = []
+                    for com_port in serial.tools.list_ports.comports():
+                        if com_port[1].find('Bluetooth') == -1:
+                            items.append(com_port)
+                    # create dropdown combobox
+                    com_port_drop_down = dpg.add_combo(items=items, width=320, callback=set_com_port, default_value="Select COM Port")
+                    refresh__button = dpg.add_button(label="Refresh", callback=refresh_com_port_list, width=120, height=30)
+
+                # baud rate
+                with dpg.group(label="Baud Rate", horizontal=True):
+                    dpg.add_text("Baud Rate:")
+                    baud_rate_drop_down = dpg.add_combo(items=[9600, 19200, 38400, 57600, 115200], width=320, default_value=baud_rate, callback=set_baud_rate)
+                # heat flux sensor
+                with dpg.group(label="Heat Flux Sensor", horizontal=True):
+                    dpg.add_text("Heat Flux Sensitivity:")
+                    dpg.add_input_text(label="uV/(W/m^2)", default_value=heat_flux_sensitivity, width=100, callback=set_heat_flux_sensitivity)
+                # cold junction temperature
+                with dpg.group(label="Cold Junction Temperature", horizontal=True):
+                    dpg.add_text("Cold Junction Temperature:")
+                    dpg.add_input_text(label="C", default_value=cold_junction_temperature, width=100, callback=set_cold_junction_temperature)
+
+
+    with dpg.file_dialog(directory_selector=False, show=False, default_filename='', callback=lambda s, a: file_dialog_callback(s, a, "csv"), id="file_dialog_csv", width=600, height=400):
+        dpg.add_file_extension(".csv")
+
+    with dpg.file_dialog(directory_selector=False, show=False, default_filename='', callback=lambda s, a: file_dialog_callback(s, a, "mat"), id="file_dialog_mat", width=600, height=400):
+        dpg.add_file_extension(".mat")
+
+    # call exit function on close (click X)
+    dpg.set_exit_callback(exit)
+
+    # create and show viewport
+    dpg.create_viewport(title=f"GigaGUI v{NUM_VERSION}", height=800, width=1000)
+
+    # trick to track the application path so we can load the icon
+    if getattr(sys, 'frozen', False):
+        applicationPath = sys._MEIPASS
+    elif __file__:
+        applicationPath = os.path.dirname(__file__)
+    dpg.set_viewport_small_icon(os.path.join(applicationPath, "hokiebird.ico"))
+
+    # start up the application!
+    dpg.setup_dearpygui()
+    dpg.show_viewport()
+    dpg.set_primary_window("Main Window", True)
+    dpg.start_dearpygui()
+    dpg.destroy_context()
